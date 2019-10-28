@@ -1,1 +1,445 @@
+#!/bin/bash
+
+# packepub - an epub packager
+#
+# version: 0.0.1 (2019.10.28)
+
+usage()
+{
+  echo ''
+  echo 'usage:' ${0} '[options] <epub> [<data dir>]'
+  echo ''
+  echo 'where options are:'
+  echo ''
+  echo '-t, --title = <title>          epub title (required!)'
+  echo '-a, --author = <author>        epub author'
+  echo '-s, --subject = <subject>      epub subject'
+  echo '-u, --uuid = <uuid>            epub UUID'
+  echo '-l, --lang = <language>        epub language'
+  echo ''
+  echo ''
+  echo 'usage: '${0}' --help'
+  echo ''
+}
+
+checkCmd()
+{
+  command -v ${1} >/dev/null 2>&1
+
+  if [[ "0" != "${?}" ]] ; then
+    echo -e '\n*** no '${1}' command available ***'
+    exit 1
+  fi
+}
+
+checkRes()
+{
+  if [[ "0" != "${?}" ]] ; then
+    echo -e '\n*** error'${1}' ***'
+    exit 1
+  fi
+}
+
+imgExt()
+{
+  ext=${1##*.}
+  extLow=`echo "${ext}" | tr '[:upper:]' '[:lower:]'`
+
+  case ${extLow} in
+     svg)
+       echo "svg+xml"
+       ;;
+
+     jpg)
+       echo "jpeg"
+       ;;
+
+     jpeg | png | gif)
+       echo ${extLow}
+       ;;
+
+     *)
+       echo "estensione immagine non supportata"
+       exit 1
+       ;;
+  esac
+}
+
+declare -r cmdZip=zip
+declare -r cmdZipnote=zipnote
+declare -r cmdZipmerge=zipmerge
+declare -r cmdXmllint=xmllint
+declare -r cmdUuidgen=uuidgen
+
+declare valTitle=""
+declare valAuthor=""
+declare valSubject=""
+declare valUuid=""
+declare valLang="en"  # default
+declare valEpub=""
+declare valDir=""
+declare valWrk=""
+declare valFileAs=""
+
+declare coverFile=""
+declare listHTags=""
+
+declare -i valLevH=5
+declare -i maxLevH=1
+declare -i hLevel=0
+declare -i level=0
+declare -i prevLevel=0
+
+declare -a arrXhtmls
+declare -a arrImages
+declare -a arrStyles
+declare -a arrIndexs
+declare -a arrTitles
+declare -a arrLevels
+declare -a arrSepars
+
+
+### parse arguments
+
+while (( ${#} > 0 )) ; do
+  case "${1}" in
+    -t | --title)   shift; valTitle=${1} ;;
+    -a | --author)  shift; valAuthor=${1} ;;
+    -s | --subject) shift; valSubject=${1} ;;
+    -u | --uuid)    shift; valUuid=${1} ;;
+    -l | --lang)    shift; valLang=${1} ;;
+    --help)         usage; exit 0 ;;
+    *.epub)         valEpub=${1} ;;
+
+    *)
+      if [[ "" == ${valDir} ]] ; then
+         valDir=${1}
+      else
+         echo -e '\n*** unexpected parameter: ${1} ***'
+         usage
+         exit 1
+      fi
+      ;;
+  esac
+
+  shift
+done
+
+
+### check some value and recover default values
+
+if [[ "" == ${valEpub} ]] ; then
+   echo -e '\n*** no epub name ***'
+   usage
+   exit 1
+fi
+
+if [[ "" == ${valTitle} ]] ; then
+   echo -e '\n*** no title ***'
+   usage
+   exit 1
+fi
+
+if [[ "" == ${valDir} ]] ; then
+   valDir="OEBPS"
+fi
+
+if [[ "" == "${valUuid}" ]] ; then
+  checkCmd ${cmdUuidgen}
+  valUuid=`${cmdUuidgen}`
+fi
+
+
+### check presence of needed commands
+
+checkCmd ${cmdZip}
+checkCmd ${cmdZipnote}
+checkCmd ${cmdZipmerge}
+checkCmd ${cmdXmllint}
+
+
+### valFileAs from valAuthor
+
+valFileAs=`echo ${valAuthor} | sed 's/\(.*\)\s\(.*\)/\2, \1/g'`
+
+checkRes "obtaining valFileAs"
+
+echo "valFileAs is " ${valFileAs}
+
+
+### load file names
+
+readarray -t -s1 arrXhtmls \
+   <<< `echo "foo"; cd ${valDir}; ls -1 [tT][eE][xX][tT]/*`
+
+checkRes "listing xhtmls"
+
+if (( 2 > ${#arrXhtmls[@]} )) ; then
+   echo -e '\n*** no xhtmls found ***'
+   exit 1
+fi
+
+readarray -t -s1 arrStyles \
+   <<< `echo "foo"; cd ${valDir}; ls -1 [sS][tT][yY][lL][eE][sS]/*`
+
+checkRes "listing styles"
+
+readarray -t -s1 arrImages \
+   <<< `echo "foo"; cd ${valDir}; ls -1 [iI][mM][aA][gG][eE][sS]/*`
+
+checkRes "listing images"
+
+echo ${#arrXhtmls[@]} ${arrXhtmls[0]}
+echo ${#arrStyles[@]} ${arrStyles[0]}
+echo ${#arrImages[@]} ${arrImages[0]}
+
+
+# get cover images from first xhtml file
+
+coverFile=`${cmdXmllint} --html --xpath 'string(//img[1]/@src)' \
+              ${valDir}/${arrXhtmls[0]} \
+         | sed 's/.*\([iI][mM][aA][gG][eE][sS]\/.*\)/\1/g'`
+
+checkRes "getting cover image file"
+
+if [[ ! -f ${valDir}/${coverFile} ]] ; then
+   echo "*** cover image file ${coverFile} don't found ***"
+   exit 1
+fi
+
+echo $coverFile
+
+
+### construct the H* list for xpath
+
+listHTags="name()='h1'"
+
+for (( i=2 ; i <= ${valLevH} ; ++i )) ; do
+  listHTags="${listHTags} or name()='h${i}'"
+done
+
+echo ${listHTags}
+
+
+### extract the titles of the xhtml files
+
+index=0
+
+for (( i=1 ; i < ${#arrXhtmls[@]} ; ++i )) ; do
+  fileTitle=`${cmdXmllint} --html --xpath "//*[${listHTags}][1]/text()" \
+             ${valDir}/${arrXhtmls[i]}`
+
+  #checkRes "extracting file title"
+  if [[ "0" != "${?}" ]] ; then
+     fileTitle=""
+  fi
+
+  if [[ "" != ${fileTitle} ]] ; then
+    hLevel=`${cmdXmllint} --html --xpath "name(//*[${listHTags}][1])" \
+               ${valDir}/${arrXhtmls[i]} \
+           | sed 's/h\(.*\)/\1/g'`
+
+    checkRes "extracting file level"
+
+    arrIndexs[index]=${i}
+    arrTitles[index]=${fileTitle}
+    arrLevels[index]=${hLevel}
+
+    ((++index))
+
+    if (( hLevel > maxLevelH )) ; then
+      maxLevelH=${hLevel}
+    fi
+  fi
+done
+
+echo ${maxLevelH}
+
+separator="  "
+
+for (( i=0 ; i <= ${maxLevelH} ; ++i )) ; do
+  arrSepars[${i}]=${separator}
+
+  separator=${separator}"  "
+done
+
+# create and zip mimetype
+
+valWrk=${valEpub}.tmp
+
+   printf "application/epub+zip" | ${cmdZip} -Xq0D -fz- ${valWrk}.tmp - \
+&& printf "@ -\n@=mimetype\n"    | ${cmdZipnote} -w ${valWrk}.tmp \
+&& ${cmdZipmerge} ${valWrk} ${valWrk}.tmp \
+&& rm ${valWrk}.tmp
+
+checkRes "zipping mimetype"
+
+
+# create and zip META-INF/container.xml
+
+   ( echo    '<?xml version="1.0"?>'
+     echo -n '<container version="1.0"'
+     echo    ' xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+     echo    '  <rootfiles>'
+     echo -n '    <rootfile full-path="'${valDir}'/content.opf"'
+     echo    ' media-type="application/oebps-package+xml"/>'
+     echo    '  </rootfiles>'
+     echo    '</container>' ) \
+   | ${cmdZip} -Xq9D ${valWrk} - \
+&& echo -e '@ -\n@=META-INF/container.xml' | ${cmdZipnote} -w ${valWrk}
+
+checkRes "zipping container.xml"
+
+
+# create and zip <main-dir>/content.opf
+
+   ( echo    '<?xml version="1.0" encoding="utf-8"?>'
+     echo -n '<package xmlns="http://www.idpf.org/2007/opf"'
+     echo -n ' xmlns:dc="http://purl.org/dc/elements/1.1/"'
+     echo -n ' xmlns:dcterms="http://purl.org/dc/terms/"'
+     echo -n ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"'
+     echo -n ' xmlns:opf="http://www.idpf.org/2007/opf"'
+     echo    ' unique-identifier="uuid_id" version="2.0">'
+     echo    '  <metadata>'
+     echo    '    <dc:title>'${valTitle}'</dc:title>'
+        [[ ! -z ${valAuthor} ]] \
+     && echo -n '    <dc:creator opf:role="aut"' \
+     && echo    ' opf:file-as="'${valFileAs}'">'${valAuthor}'</dc:creator>'
+        [[ ! -z ${valSubject} ]] \
+     && echo    '    <dc:subject>'${valSubject}'</dc:subject>'
+        [[ ! -z ${valLang} ]] \
+     && echo    '    <dc:language>'${valLang}'</dc:language>'
+     echo -n '    <dc:identifier id="uuid_id" opf:scheme="uuid"'
+     echo    '>'${valUuid}'</dc:identifier>'
+     echo    '    <meta name="cover" content="cover-image"/>'
+     echo    '  </metadata>'
+     echo    '  <manifest>'
+
+     echo -n '    <item id="cover"'
+     echo -n ' href="'${arrXhtmls[0]}'"'
+     echo    ' media-type="application/xhtml+xml"/>'
+
+     for (( i=1 ; i < ${#arrXhtmls[@]} ; ++i )) ; do
+       echo -n '    <item id="xhtml_'${i}'"'
+       echo -n ' href="'${arrXhtmls[i]}'"'
+       echo    ' media-type="application/xhtml+xml"/>'
+     done
+
+     for (( i=0 ; i < ${#arrStyles[@]} ; ++i )) ; do
+       echo -n '    <item id="style_'${i}'"'
+       echo -n ' href="'${arrStyles[i]}'"'
+       echo    ' media-type="text/css"/>'
+     done
+
+     echo -n '    <item id="cover-image"'
+     echo -n ' href="'${coverFile}'"'
+     echo    ' media-type="image/'`imgExt ${coverFile}`'"/>'
+
+     for (( i=0 ; i < ${#arrImages[@]} ; ++i )) ; do
+       if [[ "${coverFile}" != "${arrImages[i]}" ]] ; then
+         echo -n '    <item id="image_'${i}'"'
+         echo -n ' href="'${arrImages[i]}'"'
+         echo    ' media-type="image/'`imgExt ${arrImages[i]}`'"/>'
+       fi
+     done
+
+     echo -n '    <item id="ncx" href="toc.ncx" '
+     echo    ' media-type="application/x-dtbncx+xml"/>'
+     echo    '  </manifest>'
+     echo    '  <spine toc="ncx">'
+
+     echo    '    <itemref idref="cover" linear="no"/>'
+
+     for (( i=1 ; i < ${#arrXhtmls[@]} ; ++i )) ; do
+       echo    '    <itemref idref="xhtml_'${i}'"/>'
+     done
+
+     echo    '  </spine>'
+
+     echo    '  <guide>'
+     echo -n '    <reference href="'${arrXhtmls[0]}'" type="cover"'
+     echo    ' title="cover page"/>'
+     echo    '  </guide>'
+
+     echo    '</package>' ) \
+   | ${cmdZip} -Xq9D ${valWrk} - \
+&& echo -e "@ -\n@=${valDir}/content.opf" | ${cmdZipnote} -w ${valWrk}
+
+checkRes "zipping content.opf"
+
+
+# create and zip <main-dir>/toc.ncx
+
+   ( echo    '<?xml version="1.0" encoding="utf-8"?>'
+     echo -n '<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN"'
+     echo    ' "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">'
+     echo -n '<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/"'
+     echo    ' version="2005-1" xml:lang="'${valLang}'">'
+
+     echo    '  <head>'
+     echo    '    <meta name="dtb:uid" content="'${valUuid}'"/>'
+     echo    '    <meta name="dtb:depth" content="'${maxLevelH}'"/>'
+     echo    '    <meta name="dtb:totalPageCount" content="0"/>'
+     echo    '    <meta name="dtb:maxPageNumber" content="0"/>'
+     echo    '  </head>'
+
+     echo    '  <docTitle>'
+     echo    '    <text>'${valTitle}'</text>'
+     echo    '  </docTitle>'
+
+     echo    '  <navMap>'
+
+     prevLevel=0
+
+     for (( i=0 ; i < ${#arrIndexs[@]} ; ++i )) ; do
+       level=${arrLevels[${i}]}
+
+       for (( ; prevLevel >= level ; --prevLevel )) ; do
+	 echo    "${arrSepars[${prevLevel}]}"'</navPoint>'
+       done
+
+       prevLevel=${level}
+
+       s=${arrSepars[${level}]}
+
+       echo    "${s}"'<navPoint id="np_'$((i+1))'" playOrder="'$((i+1))'">'
+       echo    "${s}"'  <navLabel>'
+       echo    "${s}"'    <text>'${arrTitles[${i}]}'</text>'
+       echo    "${s}"'  </navLabel>'
+       echo    "${s}"'  <content src="'${arrXhtmls[${arrIndexs[${i}]}]}'"/>'
+     done
+
+     for (( ; prevLevel > 0 ; --prevLevel )) ; do
+       echo    "${arrSepars[${prevLevel}]}"'</navPoint>'
+     done
+
+     echo    '  </navMap>'
+     echo    '</ncx>' ) \
+   | ${cmdZip} -Xq9D ${valWrk} - \
+&& echo -e "@ -\n@=${valDir}/toc.ncx" | ${cmdZipnote} -w ${valWrk}
+
+checkRes "zipping toc.ncx"
+
+
+# zip the files
+
+${cmdZip} -Xrq9D ${valWrk} ${valDir}
+
+checkRes "zipping main directory"
+
+
+# create the epub
+
+${cmdZipmerge} ${valEpub} ${valWrk}
+
+checkRes "merging epub"
+
+
+# delete the temp file
+
+rm ${valWrk}
+
+checkRes "removing temp-file"
+
+exit 0
 
